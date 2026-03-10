@@ -3,265 +3,341 @@
 //|                                  Copyright 2024, MetaQuotes Ltd. |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
+//  Strategy: H1 trend filter + M5 pullback entry (EMA21/50 + RSI + ADX)
+//  Exits:    Partial close at TP1, breakeven, then trail to TP2
+//  Safety:   Session filter, spread guard, daily loss limit
+//  Adapts:   Win-rate based RSI/ATR tuning via GlobalVariables
+//+------------------------------------------------------------------+
 #property copyright "Copyright 2024, MetaQuotes Ltd."
 #property link      "https://www.mql5.com"
-#property version   "2.00"
+#property version   "3.00"
 #property strict
 
-//--- Input Parameters
-input string          Symbol_To_Trade  = "XAUUSD";  // Symbol
-input ENUM_TIMEFRAMES Timeframe        = PERIOD_M5;  // Timeframe
-input double          RiskPercent      = 1.0;        // Risk % per trade
-input int             EMA_Fast         = 50;         // Fast EMA period
-input int             EMA_Slow         = 200;        // Slow EMA period
-input int             RSI_Period       = 14;         // RSI period
-input int             ATR_Period       = 14;         // ATR period
-input int             Magic            = 20240101;   // Magic Number
-input int             Slippage         = 30;         // Slippage in points
-input int             LearnSampleSize  = 20;         // Trades to learn from
-input bool            ResetLearning    = false;      // Reset learned parameters
+//=== INPUTS =========================================================
+input string          Symbol_To_Trade   = "XAUUSD";  // Symbol
+input ENUM_TIMEFRAMES Timeframe         = PERIOD_M5;  // Entry timeframe
+input double          RiskPercent       = 1.0;        // Risk % per trade
+input int             Magic             = 20240101;   // Magic number
+input int             Slippage          = 30;         // Slippage (points)
 
-//--- Adaptive parameters (adjusted by the learning system)
-double g_RSI_BuyMin;
-double g_RSI_BuyMax;
-double g_RSI_SellMin;
-double g_RSI_SellMax;
-double g_ATR_SL_Mult;
-double g_ATR_TP_Mult;
-double g_ATR_Trail_Mult;
+// --- Indicators ---
+input int   EMA_Fast       = 21;    // M5 fast EMA
+input int   EMA_Slow       = 50;    // M5 slow EMA
+input int   H1_EMA         = 50;    // H1 trend EMA
+input int   RSI_Period     = 14;    // RSI period
+input int   ADX_Period     = 14;    // ADX period
+input double ADX_Min       = 20.0;  // Minimum ADX for entry
 
-//--- Default starting values
-#define DEF_RSI_BUY_MIN    45.0
-#define DEF_RSI_BUY_MAX    65.0
-#define DEF_RSI_SELL_MIN   35.0
-#define DEF_RSI_SELL_MAX   55.0
-#define DEF_ATR_SL         2.0
-#define DEF_ATR_TP         3.0
-#define DEF_ATR_TRAIL      1.5
+// --- ATR-based exits ---
+input double ATR_SL_Mult   = 1.5;   // SL = X * ATR
+input double ATR_TP1_Mult  = 1.5;   // Partial TP = X * ATR (50% close)
+input double ATR_TP2_Mult  = 3.0;   // Final TP = X * ATR
+input double ATR_Trail_Mult= 1.0;   // Trail distance after TP1 hit
 
-//--- Trade history arrays (in-memory, last LearnSampleSize trades)
-double g_TradeProfit[];   // profit/loss of each recorded trade
-double g_TradeRSI[];      // RSI at entry
-double g_TradeATR[];      // ATR at entry
-int    g_TradeCount = 0;  // total trades recorded this session
+// --- Session filter (broker server time hours, GMT+2 default) ---
+input bool   UseSessionFilter = true;  // Enable session filter
+input int    SessionStartHour = 9;     // Session open hour
+input int    SessionEndHour   = 21;    // Session close hour
 
-//--- Track last known history count to detect new closed trades
-int    g_LastHistoryCount = 0;
+// --- Safety ---
+input double MaxSpreadPoints  = 35.0;  // Max allowed spread (points)
+input double DailyLossLimit   = 2.0;   // Stop trading if daily loss > X% balance
+
+// --- Adaptive learning ---
+input int    LearnSampleSize  = 20;    // Rolling trade window for adaptation
+input bool   ResetLearning    = false; // Wipe saved learned params on start
+
+//=== ADAPTIVE PARAMS (tuned by learning system) =====================
+double g_RSI_PullbackBuy;    // RSI must dip below this before buy trigger
+double g_RSI_TriggerBuy;     // RSI must recover above this to trigger buy
+double g_RSI_PullbackSell;   // RSI must rise above this before sell trigger
+double g_RSI_TriggerSell;    // RSI must fall below this to trigger sell
+double g_ATR_SL;
+double g_ATR_TP1;
+double g_ATR_TP2;
+double g_ATR_Trail;
+
+#define DEF_RSI_PB_BUY    50.0
+#define DEF_RSI_TR_BUY    42.0
+#define DEF_RSI_PB_SELL   50.0
+#define DEF_RSI_TR_SELL   58.0
+
+//=== TRADE TRACKING =================================================
+double g_TradeProfit[];
+int    g_TradeCount   = 0;
+int    g_LastHistory  = 0;
+double g_DayStartBalance = 0;
+datetime g_LastDayCheck  = 0;
 
 //+------------------------------------------------------------------+
 int OnInit() {
    if (Symbol() != Symbol_To_Trade)
-      Print("WARNING: EA is on ", Symbol(), " but Symbol_To_Trade is ", Symbol_To_Trade);
+      Print("WARNING: Chart symbol ", Symbol(), " != ", Symbol_To_Trade);
 
    ArrayResize(g_TradeProfit, LearnSampleSize);
-   ArrayResize(g_TradeRSI,    LearnSampleSize);
-   ArrayResize(g_TradeATR,    LearnSampleSize);
    ArrayInitialize(g_TradeProfit, 0);
-   ArrayInitialize(g_TradeRSI,    0);
-   ArrayInitialize(g_TradeATR,    0);
 
-   if (ResetLearning)
-      ClearLearnedParams();
-
+   if (ResetLearning) ClearLearnedParams();
    LoadLearnedParams();
 
-   g_LastHistoryCount = OrdersHistoryTotal();
+   g_LastHistory    = OrdersHistoryTotal();
+   g_DayStartBalance = AccountBalance();
+   g_LastDayCheck   = TimeCurrent();
 
-   Print("ClaudeScalper v2 initialized | RSI Buy[", g_RSI_BuyMin, "-", g_RSI_BuyMax,
-         "] Sell[", g_RSI_SellMin, "-", g_RSI_SellMax,
-         "] SL=", g_ATR_SL_Mult, "xATR TP=", g_ATR_TP_Mult, "xATR");
+   Print("ClaudeScalper v3 | RSI pullback<", g_RSI_PullbackBuy, " trigger>", g_RSI_TriggerBuy,
+         " | SL=", g_ATR_SL, " TP1=", g_ATR_TP1, " TP2=", g_ATR_TP2);
    return(INIT_SUCCEEDED);
 }
 
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
    SaveLearnedParams();
-   Print("ClaudeScalper deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
 void OnTick() {
    if (Symbol() != Symbol_To_Trade) return;
 
+   RefreshDayBalance();
    ManageOpenTrade();
-   CheckClosedTrades();   // scan for newly closed trades → learn
+   CheckClosedTrades();
 
-   if (!IsNewBar()) return;
-   if (HasOpenTrade())  return;
+   if (!IsNewBar())    return;
+   if (HasOpenTrade()) return;
+   if (!IsTradingSession()) return;
+   if (IsSpreadTooWide())   return;
+   if (IsDailyLossHit())    return;
 
-   double emaFast = iMA(NULL, Timeframe, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE, 1);
-   double emaSlow = iMA(NULL, Timeframe, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE, 1);
-   double rsi     = iRSI(NULL, Timeframe, RSI_Period, PRICE_CLOSE, 1);
-   double atr     = iATR(NULL, Timeframe, ATR_Period, 1);
-   double price   = iClose(NULL, Timeframe, 1);
+   // --- Indicators ---
+   double emaFast  = iMA(NULL, Timeframe, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double emaSlow  = iMA(NULL, Timeframe, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double h1Ema    = iMA(NULL, PERIOD_H1, H1_EMA,   0, MODE_EMA, PRICE_CLOSE, 1);
+   double h1Close  = iClose(NULL, PERIOD_H1, 1);
+   double rsi0     = iRSI(NULL, Timeframe, RSI_Period, PRICE_CLOSE, 1);  // last closed bar
+   double rsi1     = iRSI(NULL, Timeframe, RSI_Period, PRICE_CLOSE, 2);  // bar before that
+   double adx      = iADX(NULL, Timeframe, ADX_Period, PRICE_CLOSE, MODE_MAIN, 1);
+   double atr      = iATR(NULL, Timeframe, ATR_Period, 1);
+   double price    = iClose(NULL, Timeframe, 1);
 
-   if (emaFast <= 0 || emaSlow <= 0 || atr <= 0) return;
+   if (atr <= 0 || adx <= 0) return;
 
-   double sl_dist = g_ATR_SL_Mult * atr;
-   double tp_dist = g_ATR_TP_Mult * atr;
+   // Trend alignment: M5 must agree with H1
+   bool h1Bull = (h1Close > h1Ema);
+   bool h1Bear = (h1Close < h1Ema);
+   bool m5Bull = (price > emaFast) && (emaFast > emaSlow);
+   bool m5Bear = (price < emaFast) && (emaFast < emaSlow);
 
-   bool buySignal  = (price > emaFast) && (emaFast > emaSlow)
-                     && (rsi >= g_RSI_BuyMin) && (rsi <= g_RSI_BuyMax);
-   bool sellSignal = (price < emaFast) && (emaFast < emaSlow)
-                     && (rsi >= g_RSI_SellMin) && (rsi <= g_RSI_SellMax);
+   // ADX confirms trending
+   bool trending = (adx >= ADX_Min);
 
-   if (buySignal) {
+   // RSI pullback entry: RSI dipped then recovered (buy) / rose then fell (sell)
+   bool rsiBuySignal  = (rsi1 < g_RSI_PullbackBuy) && (rsi0 > g_RSI_TriggerBuy);
+   bool rsiSellSignal = (rsi1 > g_RSI_PullbackSell) && (rsi0 < g_RSI_TriggerSell);
+
+   double sl_dist  = g_ATR_SL   * atr;
+   double tp1_dist = g_ATR_TP1  * atr;
+   double tp2_dist = g_ATR_TP2  * atr;
+
+   if (h1Bull && m5Bull && trending && rsiBuySignal) {
       double entry = Ask;
       double sl    = entry - sl_dist;
-      double tp    = entry + tp_dist;
+      double tp    = entry + tp2_dist;
       double lots  = CalculateLots(sl_dist);
       if (lots > 0) {
-         int ticket = OrderSend(Symbol(), OP_BUY, lots, entry, Slippage, sl, tp,
-                                "ClaudeScalper BUY", Magic, 0, clrGreen);
+         int ticket = OrderSend(Symbol(), OP_BUY, lots, entry, Slippage,
+                                NormalizeDouble(sl, Digits), NormalizeDouble(tp, Digits),
+                                "CS3 BUY", Magic, 0, clrGreen);
          if (ticket > 0)
-            Print("BUY opened #", ticket, " lots=", lots, " RSI=", DoubleToStr(rsi,2),
-                  " SL=", sl, " TP=", tp);
+            Print("BUY #", ticket, " lots=", lots, " RSI=", DoubleToStr(rsi0,1),
+                  " ADX=", DoubleToStr(adx,1), " SL=", sl, " TP=", tp);
          else
-            Print("BUY failed. Error: ", GetLastError());
+            Print("BUY failed err=", GetLastError());
       }
-   } else if (sellSignal) {
+   } else if (h1Bear && m5Bear && trending && rsiSellSignal) {
       double entry = Bid;
       double sl    = entry + sl_dist;
-      double tp    = entry - tp_dist;
+      double tp    = entry - tp2_dist;
       double lots  = CalculateLots(sl_dist);
       if (lots > 0) {
-         int ticket = OrderSend(Symbol(), OP_SELL, lots, entry, Slippage, sl, tp,
-                                "ClaudeScalper SELL", Magic, 0, clrRed);
+         int ticket = OrderSend(Symbol(), OP_SELL, lots, entry, Slippage,
+                                NormalizeDouble(sl, Digits), NormalizeDouble(tp, Digits),
+                                "CS3 SELL", Magic, 0, clrRed);
          if (ticket > 0)
-            Print("SELL opened #", ticket, " lots=", lots, " RSI=", DoubleToStr(rsi,2),
-                  " SL=", sl, " TP=", tp);
+            Print("SELL #", ticket, " lots=", lots, " RSI=", DoubleToStr(rsi0,1),
+                  " ADX=", DoubleToStr(adx,1), " SL=", sl, " TP=", tp);
          else
-            Print("SELL failed. Error: ", GetLastError());
+            Print("SELL failed err=", GetLastError());
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Scan order history for newly closed EA trades and learn          |
-//+------------------------------------------------------------------+
-void CheckClosedTrades() {
-   int histTotal = OrdersHistoryTotal();
-   if (histTotal <= g_LastHistoryCount) return;
-
-   for (int i = g_LastHistoryCount; i < histTotal; i++) {
-      if (!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
-      if (OrderSymbol() != Symbol() || OrderMagicNumber() != Magic) continue;
-      if (OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
-
-      double profit = OrderProfit() + OrderSwap() + OrderCommission();
-      double rsiAtEntry = iRSI(NULL, Timeframe, RSI_Period, PRICE_CLOSE, 1);
-      double atrAtEntry = iATR(NULL, Timeframe, ATR_Period, 1);
-
-      RecordTrade(profit, rsiAtEntry, atrAtEntry);
-      AdaptParameters();
-
-      Print("Learning: trade profit=", DoubleToStr(profit, 2),
-            " | new RSI Buy[", g_RSI_BuyMin, "-", g_RSI_BuyMax, "]",
-            " Sell[", g_RSI_SellMin, "-", g_RSI_SellMax, "]",
-            " SL=", g_ATR_SL_Mult, " TP=", g_ATR_TP_Mult);
-   }
-
-   g_LastHistoryCount = histTotal;
-   SaveLearnedParams();
-}
-
-//+------------------------------------------------------------------+
-//| Store trade result in circular buffer                            |
-//+------------------------------------------------------------------+
-void RecordTrade(double profit, double rsi, double atr) {
-   int idx = g_TradeCount % LearnSampleSize;
-   g_TradeProfit[idx] = profit;
-   g_TradeRSI[idx]    = rsi;
-   g_TradeATR[idx]    = atr;
-   g_TradeCount++;
-}
-
-//+------------------------------------------------------------------+
-//| Adjust adaptive parameters based on recent trade performance     |
-//+------------------------------------------------------------------+
-void AdaptParameters() {
-   int   filled  = MathMin(g_TradeCount, LearnSampleSize);
-   if (filled < 5) return;   // need at least 5 trades to start learning
-
-   int    wins       = 0;
-   double totalProfit = 0;
-   double totalLoss   = 0;
-
-   for (int i = 0; i < filled; i++) {
-      if (g_TradeProfit[i] > 0) {
-         wins++;
-         totalProfit += g_TradeProfit[i];
-      } else {
-         totalLoss += MathAbs(g_TradeProfit[i]);
-      }
-   }
-
-   double winRate     = (double)wins / filled;
-   double profitFactor = (totalLoss > 0) ? totalProfit / totalLoss : 2.0;
-
-   // --- Adapt RSI zones ---
-   // Low win rate → tighten RSI bands (require stronger confirmation)
-   // High win rate → relax slightly to catch more trades
-   double rsiStep = 1.0;
-   if (winRate < 0.40) {
-      g_RSI_BuyMin  = MathMin(g_RSI_BuyMin  + rsiStep, 55.0);
-      g_RSI_BuyMax  = MathMax(g_RSI_BuyMax  - rsiStep, 58.0);
-      g_RSI_SellMax = MathMax(g_RSI_SellMax - rsiStep, 42.0);
-      g_RSI_SellMin = MathMin(g_RSI_SellMin + rsiStep, 40.0);
-   } else if (winRate > 0.65) {
-      g_RSI_BuyMin  = MathMax(g_RSI_BuyMin  - rsiStep, 40.0);
-      g_RSI_BuyMax  = MathMin(g_RSI_BuyMax  + rsiStep, 70.0);
-      g_RSI_SellMax = MathMin(g_RSI_SellMax + rsiStep, 60.0);
-      g_RSI_SellMin = MathMax(g_RSI_SellMin - rsiStep, 30.0);
-   }
-
-   // Enforce minimum band width of 8 points
-   if (g_RSI_BuyMax - g_RSI_BuyMin < 8)   g_RSI_BuyMax  = g_RSI_BuyMin  + 8;
-   if (g_RSI_SellMax - g_RSI_SellMin < 8) g_RSI_SellMax = g_RSI_SellMin + 8;
-
-   // --- Adapt ATR multipliers ---
-   // Poor profit factor → wider SL (more room to breathe), larger TP target
-   // Good profit factor → tighter SL is fine
-   if (profitFactor < 1.0) {
-      g_ATR_SL_Mult   = MathMin(g_ATR_SL_Mult   + 0.1, 3.5);
-      g_ATR_TP_Mult   = MathMin(g_ATR_TP_Mult   + 0.1, 5.0);
-      g_ATR_Trail_Mult = MathMin(g_ATR_Trail_Mult + 0.1, 3.0);
-   } else if (profitFactor > 2.0) {
-      g_ATR_SL_Mult   = MathMax(g_ATR_SL_Mult   - 0.1, 1.5);
-      g_ATR_TP_Mult   = MathMax(g_ATR_TP_Mult   - 0.1, 2.0);
-      g_ATR_Trail_Mult = MathMax(g_ATR_Trail_Mult - 0.1, 1.0);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Trailing stop management                                         |
+//| Manage open trade: partial close → breakeven → trail             |
 //+------------------------------------------------------------------+
 void ManageOpenTrade() {
-   double atr = iATR(NULL, Timeframe, ATR_Period, 1);
+   double atr       = iATR(NULL, Timeframe, ATR_Period, 1);
    if (atr <= 0) return;
-   double trailDist = g_ATR_Trail_Mult * atr;
+
+   double tp1_dist  = g_ATR_TP1  * atr;
+   double trail_dist= g_ATR_Trail * atr;
 
    for (int i = OrdersTotal() - 1; i >= 0; i--) {
       if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
       if (OrderSymbol() != Symbol() || OrderMagicNumber() != Magic) continue;
 
-      double newSL;
+      double openPrice = OrderOpenPrice();
+      double curSL     = OrderStopLoss();
+      double curTP     = OrderTakeProfit();
+      double lots      = OrderLots();
+      int    ticket    = OrderTicket();
+
       if (OrderType() == OP_BUY) {
-         newSL = Bid - trailDist;
-         if (newSL > OrderStopLoss() + Point)
-            OrderModify(OrderTicket(), OrderOpenPrice(), NormalizeDouble(newSL, Digits),
-                        OrderTakeProfit(), 0, clrYellow);
+         double profit_dist = Bid - openPrice;
+         // Step 1: Partial close at TP1 if SL is still below entry (not yet at BE)
+         if (profit_dist >= tp1_dist && curSL < openPrice) {
+            double closeLots = NormalizeDouble(lots * 0.5, 2);
+            closeLots = MathMax(closeLots, MarketInfo(Symbol(), MODE_MINLOT));
+            if (closeLots < lots) {
+               if (OrderClose(ticket, closeLots, Bid, Slippage, clrOrange))
+                  Print("Partial close BUY #", ticket, " lots=", closeLots);
+            }
+            // Move SL to breakeven + small buffer
+            double newSL = openPrice + 0.1 * atr;
+            if (newSL > curSL)
+               OrderModify(ticket, openPrice, NormalizeDouble(newSL, Digits), curTP, 0, clrYellow);
+         }
+         // Step 2: Trail after breakeven
+         else if (curSL >= openPrice) {
+            double trailSL = Bid - trail_dist;
+            if (trailSL > curSL + Point)
+               OrderModify(ticket, openPrice, NormalizeDouble(trailSL, Digits), curTP, 0, clrYellow);
+         }
       } else if (OrderType() == OP_SELL) {
-         newSL = Ask + trailDist;
-         if (newSL < OrderStopLoss() - Point || OrderStopLoss() == 0)
-            OrderModify(OrderTicket(), OrderOpenPrice(), NormalizeDouble(newSL, Digits),
-                        OrderTakeProfit(), 0, clrYellow);
+         double profit_dist = openPrice - Ask;
+         // Step 1: Partial close at TP1
+         if (profit_dist >= tp1_dist && (curSL > openPrice || curSL == 0)) {
+            double closeLots = NormalizeDouble(lots * 0.5, 2);
+            closeLots = MathMax(closeLots, MarketInfo(Symbol(), MODE_MINLOT));
+            if (closeLots < lots) {
+               if (OrderClose(ticket, closeLots, Ask, Slippage, clrOrange))
+                  Print("Partial close SELL #", ticket, " lots=", closeLots);
+            }
+            // Move SL to breakeven - small buffer
+            double newSL = openPrice - 0.1 * atr;
+            if (newSL < curSL || curSL == 0)
+               OrderModify(ticket, openPrice, NormalizeDouble(newSL, Digits), curTP, 0, clrYellow);
+         }
+         // Step 2: Trail after breakeven
+         else if (curSL > 0 && curSL <= openPrice) {
+            double trailSL = Ask + trail_dist;
+            if (trailSL < curSL - Point)
+               OrderModify(ticket, openPrice, NormalizeDouble(trailSL, Digits), curTP, 0, clrYellow);
+         }
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Lot sizing by risk %                                             |
+//| Detect newly closed trades and adapt parameters                  |
+//+------------------------------------------------------------------+
+void CheckClosedTrades() {
+   int histTotal = OrdersHistoryTotal();
+   if (histTotal <= g_LastHistory) return;
+
+   for (int i = g_LastHistory; i < histTotal; i++) {
+      if (!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if (OrderSymbol() != Symbol() || OrderMagicNumber() != Magic) continue;
+      if (OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+
+      double profit = OrderProfit() + OrderSwap() + OrderCommission();
+      int    idx    = g_TradeCount % LearnSampleSize;
+      g_TradeProfit[idx] = profit;
+      g_TradeCount++;
+
+      AdaptParameters();
+      Print("Learn: profit=", DoubleToStr(profit,2),
+            " winRate=", DoubleToStr(CalcWinRate(),2),
+            " RSI_PB=", g_RSI_PullbackBuy, " RSI_Trig=", g_RSI_TriggerBuy);
+   }
+
+   g_LastHistory = histTotal;
+   SaveLearnedParams();
+}
+
+//+------------------------------------------------------------------+
+void AdaptParameters() {
+   int filled = MathMin(g_TradeCount, LearnSampleSize);
+   if (filled < 5) return;
+
+   double winRate = CalcWinRate();
+   double totalP = 0, totalL = 0;
+   for (int i = 0; i < filled; i++) {
+      if (g_TradeProfit[i] > 0) totalP += g_TradeProfit[i];
+      else                       totalL += MathAbs(g_TradeProfit[i]);
+   }
+   double pf = (totalL > 0) ? totalP / totalL : 2.0;
+
+   // Tighten RSI pullback threshold when losing (require deeper pullback)
+   if (winRate < 0.40) {
+      g_RSI_PullbackBuy   = MathMax(g_RSI_PullbackBuy  - 2.0, 40.0); // need deeper dip
+      g_RSI_TriggerBuy    = MathMax(g_RSI_TriggerBuy   - 1.0, 38.0);
+      g_RSI_PullbackSell  = MathMin(g_RSI_PullbackSell + 2.0, 60.0);
+      g_RSI_TriggerSell   = MathMin(g_RSI_TriggerSell  + 1.0, 62.0);
+   } else if (winRate > 0.65) {
+      g_RSI_PullbackBuy   = MathMin(g_RSI_PullbackBuy  + 1.0, 55.0); // allow shallower pullback
+      g_RSI_TriggerBuy    = MathMin(g_RSI_TriggerBuy   + 1.0, 48.0);
+      g_RSI_PullbackSell  = MathMax(g_RSI_PullbackSell - 1.0, 45.0);
+      g_RSI_TriggerSell   = MathMax(g_RSI_TriggerSell  - 1.0, 52.0);
+   }
+
+   // Poor profit factor: widen SL so trades breathe more
+   if (pf < 1.0) {
+      g_ATR_SL    = MathMin(g_ATR_SL    + 0.1, 2.5);
+      g_ATR_TP1   = MathMin(g_ATR_TP1   + 0.1, 2.5);
+      g_ATR_TP2   = MathMin(g_ATR_TP2   + 0.1, 4.5);
+   } else if (pf > 2.0) {
+      g_ATR_SL    = MathMax(g_ATR_SL    - 0.1, 1.2);
+      g_ATR_TP1   = MathMax(g_ATR_TP1   - 0.1, 1.2);
+      g_ATR_TP2   = MathMax(g_ATR_TP2   - 0.1, 2.5);
+   }
+}
+
+double CalcWinRate() {
+   int filled = MathMin(g_TradeCount, LearnSampleSize);
+   if (filled == 0) return 0.5;
+   int wins = 0;
+   for (int i = 0; i < filled; i++)
+      if (g_TradeProfit[i] > 0) wins++;
+   return (double)wins / filled;
+}
+
+//+------------------------------------------------------------------+
+//| Filters                                                          |
+//+------------------------------------------------------------------+
+bool IsTradingSession() {
+   if (!UseSessionFilter) return true;
+   int hour = TimeHour(TimeCurrent());
+   return (hour >= SessionStartHour && hour < SessionEndHour);
+}
+
+bool IsSpreadTooWide() {
+   double spread = MarketInfo(Symbol(), MODE_SPREAD);
+   return (spread > MaxSpreadPoints);
+}
+
+bool IsDailyLossHit() {
+   double dailyPnL = AccountEquity() - g_DayStartBalance;
+   double limit    = -g_DayStartBalance * DailyLossLimit / 100.0;
+   return (dailyPnL <= limit);
+}
+
+void RefreshDayBalance() {
+   datetime now = TimeCurrent();
+   if (TimeDay(now) != TimeDay(g_LastDayCheck)) {
+      g_DayStartBalance = AccountBalance();
+      g_LastDayCheck    = now;
+   }
+}
+
 //+------------------------------------------------------------------+
 double CalculateLots(double slDistance) {
    double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
@@ -269,19 +345,13 @@ double CalculateLots(double slDistance) {
    double minLot    = MarketInfo(Symbol(), MODE_MINLOT);
    double maxLot    = MarketInfo(Symbol(), MODE_MAXLOT);
    double lotStep   = MarketInfo(Symbol(), MODE_LOTSTEP);
-
    if (tickValue <= 0 || tickSize <= 0 || slDistance <= 0) return 0;
-
-   double riskAmount = AccountBalance() * RiskPercent / 100.0;
-   double slInTicks  = slDistance / tickSize;
-   double lots       = riskAmount / (slInTicks * tickValue);
-
+   double riskAmt  = AccountBalance() * RiskPercent / 100.0;
+   double lots     = riskAmt / ((slDistance / tickSize) * tickValue);
    lots = MathFloor(lots / lotStep) * lotStep;
-   lots = MathMax(minLot, MathMin(maxLot, lots));
-   return NormalizeDouble(lots, 2);
+   return NormalizeDouble(MathMax(minLot, MathMin(maxLot, lots)), 2);
 }
 
-//+------------------------------------------------------------------+
 bool HasOpenTrade() {
    for (int i = OrdersTotal() - 1; i >= 0; i--) {
       if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
@@ -290,51 +360,45 @@ bool HasOpenTrade() {
    return false;
 }
 
-//+------------------------------------------------------------------+
 bool IsNewBar() {
-   static datetime lastBarTime = 0;
-   datetime currentBarTime = iTime(NULL, Timeframe, 0);
-   if (currentBarTime != lastBarTime) {
-      lastBarTime = currentBarTime;
-      return true;
-   }
+   static datetime last = 0;
+   datetime cur = iTime(NULL, Timeframe, 0);
+   if (cur != last) { last = cur; return true; }
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| Persist learned parameters using MT4 GlobalVariables            |
+//| Persistence                                                      |
 //+------------------------------------------------------------------+
 void SaveLearnedParams() {
-   string prefix = "CS_" + Symbol_To_Trade + "_";
-   GlobalVariableSet(prefix + "RSI_BuyMin",   g_RSI_BuyMin);
-   GlobalVariableSet(prefix + "RSI_BuyMax",   g_RSI_BuyMax);
-   GlobalVariableSet(prefix + "RSI_SellMin",  g_RSI_SellMin);
-   GlobalVariableSet(prefix + "RSI_SellMax",  g_RSI_SellMax);
-   GlobalVariableSet(prefix + "ATR_SL",       g_ATR_SL_Mult);
-   GlobalVariableSet(prefix + "ATR_TP",       g_ATR_TP_Mult);
-   GlobalVariableSet(prefix + "ATR_Trail",    g_ATR_Trail_Mult);
+   string p = "CS3_" + Symbol_To_Trade + "_";
+   GlobalVariableSet(p+"RSI_PBBuy",  g_RSI_PullbackBuy);
+   GlobalVariableSet(p+"RSI_TRBuy",  g_RSI_TriggerBuy);
+   GlobalVariableSet(p+"RSI_PBSell", g_RSI_PullbackSell);
+   GlobalVariableSet(p+"RSI_TRSell", g_RSI_TriggerSell);
+   GlobalVariableSet(p+"ATR_SL",     g_ATR_SL);
+   GlobalVariableSet(p+"ATR_TP1",    g_ATR_TP1);
+   GlobalVariableSet(p+"ATR_TP2",    g_ATR_TP2);
+   GlobalVariableSet(p+"ATR_Trail",  g_ATR_Trail);
 }
 
 void LoadLearnedParams() {
-   string prefix = "CS_" + Symbol_To_Trade + "_";
-   g_RSI_BuyMin    = GlobalVariableCheck(prefix + "RSI_BuyMin")  ? GlobalVariableGet(prefix + "RSI_BuyMin")  : DEF_RSI_BUY_MIN;
-   g_RSI_BuyMax    = GlobalVariableCheck(prefix + "RSI_BuyMax")  ? GlobalVariableGet(prefix + "RSI_BuyMax")  : DEF_RSI_BUY_MAX;
-   g_RSI_SellMin   = GlobalVariableCheck(prefix + "RSI_SellMin") ? GlobalVariableGet(prefix + "RSI_SellMin") : DEF_RSI_SELL_MIN;
-   g_RSI_SellMax   = GlobalVariableCheck(prefix + "RSI_SellMax") ? GlobalVariableGet(prefix + "RSI_SellMax") : DEF_RSI_SELL_MAX;
-   g_ATR_SL_Mult   = GlobalVariableCheck(prefix + "ATR_SL")      ? GlobalVariableGet(prefix + "ATR_SL")      : DEF_ATR_SL;
-   g_ATR_TP_Mult   = GlobalVariableCheck(prefix + "ATR_TP")      ? GlobalVariableGet(prefix + "ATR_TP")      : DEF_ATR_TP;
-   g_ATR_Trail_Mult = GlobalVariableCheck(prefix + "ATR_Trail")  ? GlobalVariableGet(prefix + "ATR_Trail")   : DEF_ATR_TRAIL;
+   string p = "CS3_" + Symbol_To_Trade + "_";
+   g_RSI_PullbackBuy  = GlobalVariableCheck(p+"RSI_PBBuy")  ? GlobalVariableGet(p+"RSI_PBBuy")  : DEF_RSI_PB_BUY;
+   g_RSI_TriggerBuy   = GlobalVariableCheck(p+"RSI_TRBuy")  ? GlobalVariableGet(p+"RSI_TRBuy")  : DEF_RSI_TR_BUY;
+   g_RSI_PullbackSell = GlobalVariableCheck(p+"RSI_PBSell") ? GlobalVariableGet(p+"RSI_PBSell") : DEF_RSI_PB_SELL;
+   g_RSI_TriggerSell  = GlobalVariableCheck(p+"RSI_TRSell") ? GlobalVariableGet(p+"RSI_TRSell") : DEF_RSI_TR_SELL;
+   g_ATR_SL           = GlobalVariableCheck(p+"ATR_SL")     ? GlobalVariableGet(p+"ATR_SL")     : ATR_SL_Mult;
+   g_ATR_TP1          = GlobalVariableCheck(p+"ATR_TP1")    ? GlobalVariableGet(p+"ATR_TP1")    : ATR_TP1_Mult;
+   g_ATR_TP2          = GlobalVariableCheck(p+"ATR_TP2")    ? GlobalVariableGet(p+"ATR_TP2")    : ATR_TP2_Mult;
+   g_ATR_Trail        = GlobalVariableCheck(p+"ATR_Trail")  ? GlobalVariableGet(p+"ATR_Trail")  : ATR_Trail_Mult;
 }
 
 void ClearLearnedParams() {
-   string prefix = "CS_" + Symbol_To_Trade + "_";
-   GlobalVariableDel(prefix + "RSI_BuyMin");
-   GlobalVariableDel(prefix + "RSI_BuyMax");
-   GlobalVariableDel(prefix + "RSI_SellMin");
-   GlobalVariableDel(prefix + "RSI_SellMax");
-   GlobalVariableDel(prefix + "ATR_SL");
-   GlobalVariableDel(prefix + "ATR_TP");
-   GlobalVariableDel(prefix + "ATR_Trail");
-   Print("Learned parameters reset to defaults.");
+   string p = "CS3_" + Symbol_To_Trade + "_";
+   string keys[8] = {"RSI_PBBuy","RSI_TRBuy","RSI_PBSell","RSI_TRSell",
+                      "ATR_SL","ATR_TP1","ATR_TP2","ATR_Trail"};
+   for (int i = 0; i < 8; i++) GlobalVariableDel(p + keys[i]);
+   Print("Learned params reset.");
 }
 //+------------------------------------------------------------------+
