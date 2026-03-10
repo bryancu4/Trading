@@ -30,15 +30,24 @@ input double ATR_TP1_Mult    = 1.5;  // Partial close (50%) at X * ATR
 input double ATR_TP2_Mult    = 3.0;  // Final TP at X * ATR
 input double ATR_Trail_Mult  = 1.0;  // Trail after breakeven
 
+// --- Daily bias filter ---
+input bool   UseDailyBias  = true;  // Only trade in direction of daily bias
+input int    D1_EMA_Period  = 50;   // D1 EMA period (primary bias)
+// Bias = BULL when: D1 price > D1 EMA  AND  today's price > today's open
+// Bias = BEAR when: D1 price < D1 EMA  AND  today's price < today's open
+// Bias = NONE when: signals conflict → skip trade
+
 // --- Safety ---
 input double MaxSpread      = 35.0; // Max spread (points)
 input double DailyLossLimit = 2.0;  // Stop if daily loss > X% balance
 
 //=== GLOBALS ========================================================
-bool     g_SqueezeArmed = false;  // true once a squeeze has been detected
-double   g_BBWidth      = 0;      // current BB width % (for display)
+bool     g_SqueezeArmed = false;
+double   g_BBWidth      = 0;
 double   g_DayBalance   = 0;
+double   g_DayOpen      = 0;   // today's opening price
 datetime g_LastDay      = 0;
+int      g_DailyBias    = 0;   // 1=bull, -1=bear, 0=none
 
 #define UI_PFX "BB_"
 
@@ -62,6 +71,7 @@ void OnTick() {
    if (Symbol() != Sym) return;
 
    RefreshDay();
+   UpdateBias();
    TrackSqueeze();
    ManageTrade();
    DrawUI();
@@ -90,6 +100,13 @@ void CheckEntry() {
    bool buySignal  = (close > upper);
    bool sellSignal = (close < lower);
    if (!buySignal && !sellSignal) return;
+
+   // Apply daily bias filter
+   if (UseDailyBias) {
+      if (g_DailyBias == 0)  { Print("No clear bias today — skipping"); return; }
+      if (buySignal  && g_DailyBias != 1) { Print("BUY signal blocked by BEARISH bias"); return; }
+      if (sellSignal && g_DailyBias != -1){ Print("SELL signal blocked by BULLISH bias"); return; }
+   }
 
    double slDist = ATR_SL_Mult  * atr;
    double tpDist = ATR_TP2_Mult * atr;
@@ -201,24 +218,43 @@ void DrawUI() {
    DrawText(UI_PFX+"ULbl", "BB Upper (buy break)", t, upper, bandClr);
    DrawText(UI_PFX+"LLbl", "BB Lower (sell break)", t, lower, bandClr);
 
-   // Dashboard comment
-   string sqzLine = g_SqueezeArmed
-      ? "SQUEEZE ARMED — waiting for breakout"
-      : "Width: " + DoubleToStr(g_BBWidth, 3) + "% | Need < " + DoubleToStr(Squeeze_Pct, 2) + "%";
+   // D1 EMA and Day Open lines
+   double d1Ema  = iMA(NULL, PERIOD_D1, D1_EMA_Period, 0, MODE_EMA, PRICE_CLOSE, 1);
+   color  biasClr = (g_DailyBias == 1) ? clrLime : (g_DailyBias == -1) ? clrTomato : clrGray;
+   if (d1Ema > 0) {
+      DrawHLine(UI_PFX+"D1EMA",   d1Ema,    biasClr,    STYLE_DASH, 2);
+      DrawText(UI_PFX+"D1EMALbl", "D1 EMA(" + IntegerToString(D1_EMA_Period) + ")",
+               TimeCurrent() + PeriodSeconds(TF) * 8, d1Ema, biasClr);
+   }
+   if (g_DayOpen > 0) {
+      DrawHLine(UI_PFX+"DayOpen",   g_DayOpen, clrGold, STYLE_DOT, 1);
+      DrawText(UI_PFX+"DayOpenLbl", "Day Open: " + DoubleToStr(g_DayOpen, Digits),
+               TimeCurrent() + PeriodSeconds(TF) * 8, g_DayOpen, clrGold);
+   }
 
-   string status = HasOpenTrade()  ? "IN TRADE"    :
-                   DailyLossHit()  ? "DAILY LIMIT" :
-                   SpreadTooWide() ? "SPREAD WIDE" : "WATCHING";
+   // Dashboard comment
+   string biasStr = (g_DailyBias ==  1) ? "BULLISH — BUY only"  :
+                    (g_DailyBias == -1) ? "BEARISH — SELL only" : "NEUTRAL — no trade";
+   string sqzLine = g_SqueezeArmed
+      ? "ARMED — waiting for breakout"
+      : "Width: " + DoubleToStr(g_BBWidth, 3) + "% (need <" + DoubleToStr(Squeeze_Pct, 2) + "%)";
+   string status  = HasOpenTrade()  ? "IN TRADE"    :
+                    DailyLossHit()  ? "DAILY LIMIT" :
+                    SpreadTooWide() ? "SPREAD WIDE" : "WATCHING";
 
    Comment(
       "╔══ BreakoutBot (BB Squeeze) ══╗\n" +
       "║ Status : " + status + "\n" +
+      "║ Bias   : " + biasStr + "\n" +
       "║ Squeeze: " + sqzLine + "\n" +
-      "║ BB Upper: " + DoubleToStr(upper, Digits) + "\n" +
-      "║ BB Lower: " + DoubleToStr(lower, Digits) + "\n" +
-      "║ ATR    : " + DoubleToStr(iATR(NULL, TF, ATR_Period, 1) / Point, 1) + "pts" +
+      "╠══════════════════════════════╣\n" +
+      "║ BB Upper : " + DoubleToStr(upper, Digits) + "\n" +
+      "║ BB Lower : " + DoubleToStr(lower, Digits) + "\n" +
+      "║ D1 EMA   : " + DoubleToStr(d1Ema,      Digits) + "\n" +
+      "║ Day Open : " + DoubleToStr(g_DayOpen,   Digits) + "\n" +
+      "║ ATR: " + DoubleToStr(iATR(NULL, TF, ATR_Period, 1) / Point, 1) + "pts" +
       "  Spread: " + DoubleToStr(MarketInfo(Sym, MODE_SPREAD), 0) + "pts\n" +
-      "║ Day P&L: " + DoubleToStr(AccountEquity() - g_DayBalance, 2) + "\n" +
+      "║ Day P&L  : " + DoubleToStr(AccountEquity() - g_DayBalance, 2) + "\n" +
       "╚══════════════════════════════╝"
    );
 
@@ -277,8 +313,33 @@ void RefreshDay() {
    datetime now = TimeCurrent();
    if (TimeDay(now) != TimeDay(g_LastDay)) {
       g_DayBalance = AccountBalance();
+      g_DayOpen    = iOpen(NULL, PERIOD_D1, 0);
       g_LastDay    = now;
    }
+   if (g_DayOpen == 0) g_DayOpen = iOpen(NULL, PERIOD_D1, 0);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate today's directional bias                              |
+//|  BULL  (+1): D1 price > D1 EMA  AND  price > today's open       |
+//|  BEAR  (-1): D1 price < D1 EMA  AND  price < today's open       |
+//|  NONE   (0): mixed signals → sit out                             |
+//+------------------------------------------------------------------+
+void UpdateBias() {
+   double d1Close  = iClose(NULL, PERIOD_D1, 1);   // yesterday's close (confirmed)
+   double d1Ema    = iMA(NULL, PERIOD_D1, D1_EMA_Period, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double curPrice = (Bid + Ask) / 2.0;
+
+   if (d1Ema <= 0 || g_DayOpen <= 0) { g_DailyBias = 0; return; }
+
+   bool d1Bull = (d1Close > d1Ema);   // daily trend up
+   bool d1Bear = (d1Close < d1Ema);   // daily trend down
+   bool intBull = (curPrice > g_DayOpen);  // intraday moving up
+   bool intBear = (curPrice < g_DayOpen);  // intraday moving down
+
+   if (d1Bull && intBull)      g_DailyBias =  1;
+   else if (d1Bear && intBear) g_DailyBias = -1;
+   else                        g_DailyBias =  0;
 }
 
 bool IsNewBar() {
