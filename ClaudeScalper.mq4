@@ -25,6 +25,7 @@ input int   EMA_Fast       = 21;    // M5 fast EMA
 input int   EMA_Slow       = 50;    // M5 slow EMA
 input int   H1_EMA         = 50;    // H1 trend EMA
 input int   RSI_Period     = 14;    // RSI period
+input int   ATR_Period     = 14;    // ATR period
 input int   ADX_Period     = 14;    // ADX period
 input double ADX_Min       = 20.0;  // Minimum ADX for entry
 
